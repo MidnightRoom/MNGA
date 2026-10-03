@@ -49,23 +49,43 @@ peg::parser! {
         rule close_tag() -> &'input str
             = left_close_bracket() t:token() right_bracket() { t }
 
+        rule close_tag_for(expected: &'input str) -> &'input str
+            = left_close_bracket() t:token() right_bracket() {? if t.eq_ignore_ascii_case(expected) { Ok(t) } else { Err("close tag mismatch") } }
+
+        // Only tags in this whitelist are parsed as tags; any other bracketed
+        // token is plain text, exactly like the web page renders it.
+        rule known_start_tag() -> (&'input str, Vec<&'input str>, Vec<&'input str>)
+            = left_bracket() t:token() a:attributes()? c:complex_attrs()? right_bracket()
+              {? if is_known_tag(t) { Ok((t, a.unwrap_or_default(), c.unwrap_or_default())) } else { Err("unknown tag") } }
+
+        rule known_close_tag() -> &'input str
+            = left_close_bracket() t:token() right_bracket() {? if is_known_tag(t) { Ok(t) } else { Err("unknown tag") } }
+
+        rule orphan_close_tag() -> Span
+            // A closing tag that matches no open tag: render literally, like browsers do.
+            = ct:close_tag() {
+                span_of!(plain(Span_Plain {
+                    text: format!("[/{}]", ct),
+                    ..Default::default()
+                }))
+            }
+
         rule plain_text() -> &'input str
-            = $( (!(start_tag() / close_tag() / br_tag() / left_sticker_bracket() / divider_tag()) any_char())+ )
+            = $( (!(known_start_tag() / known_close_tag() / br_tag() / left_sticker_bracket() / divider_tag()) any_char())+ )
 
         rule tagged() -> Span
-            = st:start_tag() s:(span()*) ct:close_tag()? {?
+            = st:known_start_tag() s:(span()*) ct:known_close_tag()? {
                 let (start_tag, attributes, complex_attributes) = st;
-                // if !start_tag.contains(ct) { return Err("matched close tag"); } // todo: add a flag for this check
                 let attributes = attributes.into_iter().map(|s| s.to_owned()).collect();
                 let complex_attributes = complex_attributes.into_iter().map(|s| s.to_owned()).collect();
 
-                Ok(span_of!(tagged(Span_Tagged {
+                span_of!(tagged(Span_Tagged {
                     tag: start_tag.to_ascii_lowercase(),
                     attributes,
                     complex_attributes,
                     spans: s.into(),
                     ..Default::default()
-                })))
+                }))
             }
 
         rule sticker() -> Span
@@ -125,6 +145,23 @@ peg::parser! {
         pub rule content() -> Vec<Span>
             = (span())*
     }
+}
+
+/// Whitelist of BBCode tags recognized by the parser. Anything else in
+/// brackets is treated as plain text, mirroring the web page's behavior
+/// and preventing such pseudo tags from swallowing real closing tags.
+fn is_known_tag(tag: &str) -> bool {
+    const KNOWN_TAGS: &[&str] = &[
+        "quote", "b", "u", "i", "del", "color", "size", "font", "list", "align",
+        "code", "table", "tr", "td", "td1", "td2", "td3", "collapse", "img",
+        "album", "noimg", "flash", "audio", "video", "attach", "url", "tid",
+        "pid", "uid", "at", "dice", "h", "s", "stripbr", "randomblock",
+        "style", "fixsize", "version",
+    ];
+    let tag = tag.to_ascii_lowercase();
+    // `td20`-style width variants are real table tags used by NGA posts.
+    KNOWN_TAGS.contains(&tag.as_str())
+        || (tag.starts_with("td") && tag[2..].chars().all(|c| c.is_ascii_digit()))
 }
 
 pub fn do_parse_content(text: &str) -> ParseResult<Vec<Span>> {
