@@ -17,7 +17,7 @@ class ContentCombiner {
     case other(AnyView)
   }
 
-  // When building view with children, using...
+  /// When building view with children, using...
   enum TableContext {
     case none // VStack
     case table // Grid
@@ -65,7 +65,7 @@ class ContentCombiner {
     "white": whiteColor,
   ]
 
-  // Tags in this list will be ignored and the spans will be visited directly.
+  /// Tags in this list will be ignored and the spans will be visited directly.
   private static let ignoredTags = [
     "font",
   ]
@@ -118,8 +118,8 @@ class ContentCombiner {
     set { setEnv(key: "inQuote", value: newValue ? "true" : nil) }
   }
 
-  // When rendering an inline "quoted post" summary, we want to skip *reply quotes*
-  // (quotes that reference another post and have reply metadata), but keep other quote usage.
+  /// When rendering an inline "quoted post" summary, we want to skip *reply quotes*
+  /// (quotes that reference another post and have reply metadata), but keep other quote usage.
   var inInlineReplyQuote: Bool {
     get { getEnv(key: "inInlineReplyQuote") != nil }
     set { setEnv(key: "inInlineReplyQuote", value: newValue ? "true" : nil) }
@@ -148,6 +148,20 @@ class ContentCombiner {
   var diceContext: DiceRoller.Context? {
     get { getEnv(key: "diceContext") as? DiceRoller.Context }
     set { setEnv(key: "diceContext", value: newValue) }
+  }
+
+  /// Depth of the current combiner in the span tree. Deeply nested (possibly
+  /// malformed) content can otherwise produce huge SwiftUI layout trees.
+  private var depth: Int {
+    (parent?.depth ?? 0) + 1
+  }
+
+  /// Beyond this depth, container tags (quote/collapse/list/etc.) are rendered
+  /// as flattened plain text to bound the layout cost.
+  static let maxRenderingDepth = 20
+
+  private var tooDeep: Bool {
+    depth >= Self.maxRenderingDepth
   }
 
   private func nextDiceSeedOffset() -> Int {
@@ -312,6 +326,22 @@ class ContentCombiner {
     spans.forEach(visit(span:))
   }
 
+  /// Extract readable text from a span subtree, used when the subtree is too
+  /// deep to render structurally.
+  private static func collectPlainText(from spans: [Span], into text: inout String) {
+    for span in spans {
+      switch span.value {
+      case let .plain(p):
+        text += p.text
+      case let .tagged(t):
+        text += " "
+        collectPlainText(from: t.spans, into: &text)
+      default:
+        text += " "
+      }
+    }
+  }
+
   func visit(span: Span) {
     guard let value = span.value else { return }
 
@@ -393,8 +423,19 @@ class ContentCombiner {
     return items
   }
 
+  // Indentation per nesting level of list items. Bounded so that deeply
+  // nested (possibly malformed) lists cannot push content off-screen or
+  // collapse its width to zero.
+  static let maxListIndentationLevels = 6
+
+  private var listIndentationLevel: Int {
+    get { getEnv(key: "listIndentationLevel") as? Int ?? 0 }
+    set { setEnv(key: "listIndentationLevel", value: newValue) }
+  }
+
   private func buildListItemView(spans: [Span]) -> AnyView? {
     let itemCombiner = ContentCombiner(parent: self)
+    itemCombiner.listIndentationLevel = listIndentationLevel + 1
     itemCombiner.visit(spans: spans)
 
     let content: AnyView
@@ -408,9 +449,15 @@ class ContentCombiner {
       content = any
     }
 
+    // Stop indenting beyond the cap; this keeps the content column wide
+    // enough to lay out text normally regardless of nesting depth.
+    let isIndented = listIndentationLevel < Self.maxListIndentationLevels
+
     let row = HStack(alignment: .top, spacing: 8) {
-      styledText(Text("•"))
-        .frame(width: 12, alignment: .leading)
+      if isIndented {
+        styledText(Text("•"))
+          .frame(width: 12, alignment: .leading)
+      }
       content
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -471,6 +518,16 @@ class ContentCombiner {
   }
 
   private func visit(tagged: Span.Tagged) {
+    // Render deeply nested container tags as plain text to bound layout cost.
+    if tooDeep {
+      var text = ""
+      Self.collectPlainText(from: tagged.spans, into: &text)
+      if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        append(Text(text))
+      }
+      return
+    }
+
     switch tagged.tag {
     case "_divider",
          "h":
@@ -557,7 +614,13 @@ class ContentCombiner {
   }
 
   private func visit(album: Span.Tagged) {
-    let urls = album.spans.filter { if case .plain = $0.value { true } else { false } }
+    let urls = album.spans.filter {
+      if case .plain = $0.value {
+        true
+      } else {
+        false
+      }
+    }
     let name = "\(album.attributes.first ?? "Album".localized) (\(urls.count))"
 
     visit(divider: .with {
@@ -772,10 +835,46 @@ class ContentCombiner {
     append(view)
   }
 
+  /// Reconstruct the literal BBCode source of a span subtree, used to render
+  /// code blocks verbatim (tags inside `[code]` must display as text, not be
+  /// interpreted).
+  private static func collectLiteralText(from spans: [Span], into text: inout String) {
+    for span in spans {
+      switch span.value {
+      case let .plain(p):
+        text += p.text
+      case .breakLine:
+        text += "\n"
+      case let .tagged(t):
+        var open = "[\(t.tag)"
+        if !t.attributes.isEmpty {
+          open += "=" + t.attributes.joined(separator: ",")
+        }
+        if !t.complexAttributes.isEmpty {
+          open += " " + t.complexAttributes.joined(separator: " ")
+        }
+        text += open + "]"
+        collectLiteralText(from: t.spans, into: &text)
+        text += "[/\(t.tag)]"
+      default:
+        break
+      }
+    }
+  }
+
   private func visit(code: Span.Tagged) {
-    let combiner = ContentCombiner(parent: self, font: { _ in Font.system(.footnote, design: .monospaced) })
-    combiner.visit(spans: code.spans)
-    append(combiner.build())
+    // Code blocks display their content verbatim: inner tags are part of
+    // the example being shown, not formatting to apply.
+    var literal = ""
+    Self.collectLiteralText(from: code.spans, into: &literal)
+
+    let textView = Text(literal)
+      .font(.system(.footnote, design: .monospaced))
+      .padding(8)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .background(Color.primary.opacity(0.06))
+      .cornerRadius(6)
+    append(textView)
   }
 
   private func visit(underlined: Span.Tagged) {
